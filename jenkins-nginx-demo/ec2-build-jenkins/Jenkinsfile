@@ -1,0 +1,719 @@
+pipeline {
+    agent any
+
+    options {
+        timestamps()
+        disableConcurrentBuilds()
+
+        buildDiscarder(
+            logRotator(
+                numToKeepStr: '10',
+                artifactNumToKeepStr: '5'
+            )
+        )
+    }
+
+    parameters {
+        string(
+            name: 'AWS_REGION',
+            defaultValue: 'us-east-1',
+            description: 'AWS region for the EC2 deployment'
+        )
+
+        string(
+            name: 'VPC_ID',
+            defaultValue: '',
+            description: 'VPC ID, for example vpc-0123456789abcdef0'
+        )
+
+        string(
+            name: 'SUBNET_ID',
+            defaultValue: '',
+            description: 'Public subnet ID, for example subnet-0123456789abcdef0'
+        )
+
+        choice(
+            name: 'INSTANCE_TYPE',
+            choices: [
+                't3.micro',
+                't2.micro'
+            ],
+            description: 'EC2 instance type'
+        )
+
+        booleanParam(
+            name: 'AUTO_DESTROY',
+            defaultValue: false,
+            description: 'Terminate EC2 and delete the security group after testing'
+        )
+    }
+
+    environment {
+        APP_NAME = 'jenkins-sample-app'
+    }
+
+    stages {
+
+        stage('Pre-Checks') {
+            steps {
+                sh '''
+                    set -eu
+
+                    echo "Checking required commands..."
+
+                    command -v aws
+                    command -v curl
+                    command -v base64
+                    command -v tar
+
+                    aws --version
+                    curl --version | head -1
+
+                    if [ -z "$AWS_REGION" ]; then
+                        echo "ERROR: AWS_REGION is required"
+                        exit 1
+                    fi
+
+                    if [ -z "$VPC_ID" ]; then
+                        echo "ERROR: VPC_ID is required"
+                        exit 1
+                    fi
+
+                    if [ -z "$SUBNET_ID" ]; then
+                        echo "ERROR: SUBNET_ID is required"
+                        exit 1
+                    fi
+
+                    case "$VPC_ID" in
+                        vpc-*)
+                            ;;
+                        *)
+                            echo "ERROR: VPC_ID must start with vpc-"
+                            exit 1
+                            ;;
+                    esac
+
+                    case "$SUBNET_ID" in
+                        subnet-*)
+                            ;;
+                        *)
+                            echo "ERROR: SUBNET_ID must start with subnet-"
+                            exit 1
+                            ;;
+                    esac
+
+                    echo "Pre-checks completed successfully"
+                '''
+            }
+        }
+
+        stage('Validate AWS Access') {
+            steps {
+                withCredentials([[
+                    $class: 'AmazonWebServicesCredentialsBinding',
+                    credentialsId: 'aws-credentials'
+                ]]) {
+                    sh '''
+                        set -eu
+
+                        echo "Validating AWS credentials..."
+
+                        aws sts get-caller-identity \
+                            --region "$AWS_REGION"
+
+                        echo "Validating VPC..."
+
+                        VPC_STATE=$(aws ec2 describe-vpcs \
+                            --vpc-ids "$VPC_ID" \
+                            --region "$AWS_REGION" \
+                            --query 'Vpcs[0].State' \
+                            --output text)
+
+                        if [ "$VPC_STATE" != "available" ]; then
+                            echo "ERROR: VPC is not available"
+                            echo "VPC state: $VPC_STATE"
+                            exit 1
+                        fi
+
+                        echo "Validating subnet..."
+
+                        SUBNET_VPC_ID=$(aws ec2 describe-subnets \
+                            --subnet-ids "$SUBNET_ID" \
+                            --region "$AWS_REGION" \
+                            --query 'Subnets[0].VpcId' \
+                            --output text)
+
+                        if [ "$SUBNET_VPC_ID" != "$VPC_ID" ]; then
+                            echo "ERROR: Subnet does not belong to the supplied VPC"
+                            echo "Requested VPC: $VPC_ID"
+                            echo "Subnet VPC:    $SUBNET_VPC_ID"
+                            exit 1
+                        fi
+
+                        SUBNET_STATE=$(aws ec2 describe-subnets \
+                            --subnet-ids "$SUBNET_ID" \
+                            --region "$AWS_REGION" \
+                            --query 'Subnets[0].State' \
+                            --output text)
+
+                        if [ "$SUBNET_STATE" != "available" ]; then
+                            echo "ERROR: Subnet is not available"
+                            echo "Subnet state: $SUBNET_STATE"
+                            exit 1
+                        fi
+
+                        echo "AWS access and network validation successful"
+                    '''
+                }
+            }
+        }
+
+        stage('Build') {
+            steps {
+                sh '''
+                    set -eu
+
+                    echo "Creating sample application..."
+
+                    rm -rf build
+                    rm -f sgid.txt amiid.txt instanceid.txt publicip.txt
+
+                    mkdir -p build
+
+                    cat > build/index.html <<'HTML'
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+
+    <meta
+        name="viewport"
+        content="width=device-width, initial-scale=1.0"
+    >
+
+    <title>Jenkins EC2 Deployment</title>
+
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            background: #f4f7fb;
+            text-align: center;
+            padding-top: 100px;
+        }
+
+        .container {
+            background: white;
+            width: 70%;
+            margin: auto;
+            padding: 40px;
+            border-radius: 10px;
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+        }
+
+        h1 {
+            color: #1f6feb;
+        }
+
+        p {
+            color: #444;
+            font-size: 18px;
+        }
+
+        .success {
+            color: green;
+            font-weight: bold;
+        }
+    </style>
+</head>
+
+<body>
+    <div class="container">
+        <h1>Jenkins Deployment Successful</h1>
+
+        <p class="success">
+            Build, validation and deployment completed successfully.
+        </p>
+
+        <p>
+            This Amazon EC2 instance was created from a Jenkins pipeline.
+        </p>
+
+        <p>
+            The application is running on Nginx.
+        </p>
+    </div>
+</body>
+</html>
+HTML
+
+                    test -s build/index.html
+
+                    echo "Build completed successfully"
+                    ls -lh build/index.html
+                '''
+            }
+        }
+
+        stage('Validate Code') {
+            steps {
+                sh '''
+                    set -eu
+
+                    echo "Validating application..."
+
+                    test -f build/index.html
+                    test -s build/index.html
+
+                    grep -qi '<!DOCTYPE html>' build/index.html
+                    grep -qi '<html' build/index.html
+                    grep -qi '</html>' build/index.html
+                    grep -q 'Jenkins Deployment Successful' build/index.html
+                    grep -q 'The application is running on Nginx' build/index.html
+
+                    echo "Application validation successful"
+                '''
+            }
+        }
+
+        stage('Package Application') {
+            steps {
+                sh '''
+                    set -eu
+
+                    echo "Packaging application..."
+
+                    tar -czf build/jenkins-sample-app.tar.gz \
+                        -C build \
+                        index.html
+
+                    test -s build/jenkins-sample-app.tar.gz
+
+                    echo "Build artifact created:"
+                    ls -lh build/jenkins-sample-app.tar.gz
+                '''
+
+                archiveArtifacts(
+                    artifacts: 'build/jenkins-sample-app.tar.gz',
+                    fingerprint: true
+                )
+            }
+        }
+
+        stage('Prepare EC2 User Data') {
+            steps {
+                sh '''
+                    set -eu
+
+                    echo "Preparing EC2 user-data script..."
+
+                    HTML_BASE64=$(base64 -w 0 build/index.html)
+
+                    cat > build/user-data.sh <<EOF
+#!/bin/bash
+set -euxo pipefail
+
+dnf install -y nginx
+
+echo "${HTML_BASE64}" | base64 -d > /usr/share/nginx/html/index.html
+
+chown root:root /usr/share/nginx/html/index.html
+chmod 644 /usr/share/nginx/html/index.html
+
+systemctl enable nginx
+systemctl restart nginx
+
+echo "Jenkins application deployment completed" \
+    > /var/log/jenkins-deployment.log
+EOF
+
+                    chmod 700 build/user-data.sh
+
+                    test -s build/user-data.sh
+                    grep -q 'dnf install -y nginx' build/user-data.sh
+
+                    echo "EC2 user-data script prepared successfully"
+                '''
+            }
+        }
+
+        stage('Create Security Group') {
+            steps {
+                withCredentials([[
+                    $class: 'AmazonWebServicesCredentialsBinding',
+                    credentialsId: 'aws-credentials'
+                ]]) {
+                    sh '''
+                        set -eu
+
+                        SG_NAME="${APP_NAME}-${BUILD_NUMBER}-sg"
+
+                        echo "Creating security group: $SG_NAME"
+
+                        SECURITY_GROUP_ID=$(aws ec2 create-security-group \
+                            --group-name "$SG_NAME" \
+                            --description "HTTP access for Jenkins test deployment" \
+                            --vpc-id "$VPC_ID" \
+                            --region "$AWS_REGION" \
+                            --query 'GroupId' \
+                            --output text)
+
+                        case "$SECURITY_GROUP_ID" in
+                            sg-*)
+                                ;;
+                            *)
+                                echo "ERROR: Invalid Security Group ID: $SECURITY_GROUP_ID"
+                                exit 1
+                                ;;
+                        esac
+
+                        printf '%s' "$SECURITY_GROUP_ID" > sgid.txt
+
+                        echo "Security Group ID: $SECURITY_GROUP_ID"
+
+                        echo "Opening TCP port 80..."
+
+                        aws ec2 authorize-security-group-ingress \
+                            --group-id "$SECURITY_GROUP_ID" \
+                            --protocol tcp \
+                            --port 80 \
+                            --cidr 0.0.0.0/0 \
+                            --region "$AWS_REGION"
+
+                        echo "Tagging security group..."
+
+                        aws ec2 create-tags \
+                            --resources "$SECURITY_GROUP_ID" \
+                            --region "$AWS_REGION" \
+                            --tags \
+                                Key=Name,Value="$SG_NAME" \
+                                Key=Application,Value="$APP_NAME" \
+                                Key=ManagedBy,Value=Jenkins \
+                                Key=BuildNumber,Value="$BUILD_NUMBER"
+
+                        echo "Security group configuration completed"
+                    '''
+
+                    script {
+                        def sgId = readFile('sgid.txt').trim()
+
+                        if (!sgId.startsWith('sg-')) {
+                            error("Invalid Security Group ID in sgid.txt: ${sgId}")
+                        }
+
+                        echo "Security Group Created: ${sgId}"
+                    }
+                }
+            }
+        }
+
+        stage('Find Amazon Linux AMI') {
+            steps {
+                withCredentials([[
+                    $class: 'AmazonWebServicesCredentialsBinding',
+                    credentialsId: 'aws-credentials'
+                ]]) {
+                    sh '''
+                        set -eu
+
+                        echo "Finding latest Amazon Linux 2023 AMI..."
+
+                        AMI_ID=$(aws ssm get-parameter \
+                            --name /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64 \
+                            --region "$AWS_REGION" \
+                            --query 'Parameter.Value' \
+                            --output text)
+
+                        case "$AMI_ID" in
+                            ami-*)
+                                ;;
+                            *)
+                                echo "ERROR: Invalid AMI ID: $AMI_ID"
+                                exit 1
+                                ;;
+                        esac
+
+                        printf '%s' "$AMI_ID" > amiid.txt
+
+                        echo "Amazon Linux AMI ID: $AMI_ID"
+                    '''
+
+                    script {
+                        def amiId = readFile('amiid.txt').trim()
+
+                        if (!amiId.startsWith('ami-')) {
+                            error("Invalid AMI ID in amiid.txt: ${amiId}")
+                        }
+
+                        echo "AMI Selected: ${amiId}"
+                    }
+                }
+            }
+        }
+
+        stage('Validate Deployment Variables') {
+            steps {
+                script {
+                    def sgId = readFile('sgid.txt').trim()
+                    def amiId = readFile('amiid.txt').trim()
+
+                    echo "AMI ID: ${amiId}"
+                    echo "Security Group ID: ${sgId}"
+                    echo "AWS Region: ${params.AWS_REGION}"
+                    echo "VPC ID: ${params.VPC_ID}"
+                    echo "Subnet ID: ${params.SUBNET_ID}"
+                    echo "Instance Type: ${params.INSTANCE_TYPE}"
+
+                    if (!amiId.startsWith('ami-')) {
+                        error('AMI ID is missing or invalid')
+                    }
+
+                    if (!sgId.startsWith('sg-')) {
+                        error('Security Group ID is missing or invalid')
+                    }
+                }
+            }
+        }
+
+        stage('Create EC2 and Deploy') {
+            steps {
+                withCredentials([[
+                    $class: 'AmazonWebServicesCredentialsBinding',
+                    credentialsId: 'aws-credentials'
+                ]]) {
+                    sh '''
+                        set -eu
+
+                        AMI_ID=$(cat amiid.txt)
+                        SECURITY_GROUP_ID=$(cat sgid.txt)
+
+                        echo "Creating EC2 instance..."
+                        echo "AMI: $AMI_ID"
+                        echo "Security Group: $SECURITY_GROUP_ID"
+                        echo "Subnet: $SUBNET_ID"
+                        echo "Instance Type: $INSTANCE_TYPE"
+
+                        INSTANCE_ID=$(aws ec2 run-instances \
+                            --image-id "$AMI_ID" \
+                            --instance-type "$INSTANCE_TYPE" \
+                            --subnet-id "$SUBNET_ID" \
+                            --security-group-ids "$SECURITY_GROUP_ID" \
+                            --associate-public-ip-address \
+                            --user-data file://build/user-data.sh \
+                            --metadata-options \
+                                HttpTokens=required,HttpEndpoint=enabled \
+                            --block-device-mappings \
+                                'DeviceName=/dev/xvda,Ebs={VolumeSize=10,VolumeType=gp3,Encrypted=true,DeleteOnTermination=true}' \
+                            --tag-specifications \
+                                "ResourceType=instance,Tags=[{Key=Name,Value=${APP_NAME}-${BUILD_NUMBER}},{Key=Application,Value=${APP_NAME}},{Key=ManagedBy,Value=Jenkins},{Key=BuildNumber,Value=${BUILD_NUMBER}}]" \
+                                "ResourceType=volume,Tags=[{Key=Name,Value=${APP_NAME}-${BUILD_NUMBER}-volume},{Key=Application,Value=${APP_NAME}},{Key=ManagedBy,Value=Jenkins},{Key=BuildNumber,Value=${BUILD_NUMBER}}]" \
+                            --region "$AWS_REGION" \
+                            --query 'Instances[0].InstanceId' \
+                            --output text)
+
+                        case "$INSTANCE_ID" in
+                            i-*)
+                                ;;
+                            *)
+                                echo "ERROR: Invalid EC2 Instance ID: $INSTANCE_ID"
+                                exit 1
+                                ;;
+                        esac
+
+                        printf '%s' "$INSTANCE_ID" > instanceid.txt
+
+                        echo "EC2 instance created: $INSTANCE_ID"
+                    '''
+                }
+            }
+        }
+
+        stage('Wait for EC2') {
+            steps {
+                withCredentials([[
+                    $class: 'AmazonWebServicesCredentialsBinding',
+                    credentialsId: 'aws-credentials'
+                ]]) {
+                    sh '''
+                        set -eu
+
+                        INSTANCE_ID=$(cat instanceid.txt)
+
+                        echo "Waiting for EC2 instance to enter running state..."
+
+                        aws ec2 wait instance-running \
+                            --instance-ids "$INSTANCE_ID" \
+                            --region "$AWS_REGION"
+
+                        echo "EC2 instance is running"
+
+                        echo "Waiting for EC2 status checks..."
+
+                        aws ec2 wait instance-status-ok \
+                            --instance-ids "$INSTANCE_ID" \
+                            --region "$AWS_REGION"
+
+                        echo "EC2 status checks passed"
+                    '''
+                }
+            }
+        }
+
+        stage('Get Public IP') {
+            steps {
+                withCredentials([[
+                    $class: 'AmazonWebServicesCredentialsBinding',
+                    credentialsId: 'aws-credentials'
+                ]]) {
+                    sh '''
+                        set -eu
+
+                        INSTANCE_ID=$(cat instanceid.txt)
+
+                        PUBLIC_IP=$(aws ec2 describe-instances \
+                            --instance-ids "$INSTANCE_ID" \
+                            --region "$AWS_REGION" \
+                            --query 'Reservations[0].Instances[0].PublicIpAddress' \
+                            --output text)
+
+                        if [ -z "$PUBLIC_IP" ] ||
+                           [ "$PUBLIC_IP" = "None" ] ||
+                           [ "$PUBLIC_IP" = "null" ]
+                        then
+                            echo "ERROR: EC2 did not receive a public IP"
+                            echo "Verify that the selected subnet is public"
+                            exit 1
+                        fi
+
+                        printf '%s' "$PUBLIC_IP" > publicip.txt
+
+                        echo "EC2 public IP: $PUBLIC_IP"
+                        echo "Application URL: http://$PUBLIC_IP"
+                    '''
+                }
+            }
+        }
+
+        stage('Smoke Test') {
+            steps {
+                sh '''
+                    set -eu
+
+                    PUBLIC_IP=$(cat publicip.txt)
+
+                    echo "Waiting for Nginx and application deployment..."
+
+                    SUCCESS=0
+
+                    for ATTEMPT in $(seq 1 30)
+                    do
+                        echo "HTTP test attempt: $ATTEMPT"
+
+                        RESPONSE=$(curl \
+                            --fail \
+                            --silent \
+                            --show-error \
+                            --connect-timeout 5 \
+                            --max-time 10 \
+                            "http://$PUBLIC_IP" 2>/dev/null || true)
+
+                        if echo "$RESPONSE" |
+                            grep -q "Jenkins Deployment Successful"
+                        then
+                            SUCCESS=1
+                            break
+                        fi
+
+                        sleep 10
+                    done
+
+                    if [ "$SUCCESS" -ne 1 ]; then
+                        echo "ERROR: Application smoke test failed"
+                        echo "Application URL: http://$PUBLIC_IP"
+                        echo "Check /var/log/cloud-init-output.log on the EC2 instance"
+                        exit 1
+                    fi
+
+                    echo "Application smoke test successful"
+                    echo "Application URL: http://$PUBLIC_IP"
+                '''
+            }
+        }
+
+        stage('Deployment Summary') {
+            steps {
+                script {
+                    def amiId = readFile('amiid.txt').trim()
+                    def sgId = readFile('sgid.txt').trim()
+                    def instanceId = readFile('instanceid.txt').trim()
+                    def publicIp = readFile('publicip.txt').trim()
+
+                    echo """
+Deployment completed successfully.
+
+AWS Region       : ${params.AWS_REGION}
+AMI ID           : ${amiId}
+EC2 Instance ID  : ${instanceId}
+Instance Type    : ${params.INSTANCE_TYPE}
+Security Group   : ${sgId}
+Public IP        : ${publicIp}
+Application URL  : http://${publicIp}
+Auto Destroy     : ${params.AUTO_DESTROY}
+"""
+                }
+            }
+        }
+
+        stage('Auto Destroy') {
+            when {
+                expression {
+                    return params.AUTO_DESTROY
+                }
+            }
+
+            steps {
+                withCredentials([[
+                    $class: 'AmazonWebServicesCredentialsBinding',
+                    credentialsId: 'aws-credentials'
+                ]]) {
+                    sh '''
+                        set -eu
+
+                        INSTANCE_ID=$(cat instanceid.txt)
+                        SECURITY_GROUP_ID=$(cat sgid.txt)
+
+                        echo "AUTO_DESTROY is enabled"
+
+                        aws ec2 terminate-instances \
+                            --instance-ids "$INSTANCE_ID" \
+                            --region "$AWS_REGION"
+
+                        echo "Waiting for EC2 termination..."
+
+                        aws ec2 wait instance-terminated \
+                            --instance-ids "$INSTANCE_ID" \
+                            --region "$AWS_REGION"
+
+                        echo "EC2 instance terminated"
+
+                        aws ec2 delete-security-group \
+                            --group-id "$SECURITY_GROUP_ID" \
+                            --region "$AWS_REGION"
+
+                        echo "Security group deleted"
+                        echo "Test resources destroyed successfully"
+                    '''
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            echo '''
+Build, validation and EC2 deployment completed successfully.
+'''
+        }
+
+        failure {
+            echo '''
+Pipeline failed.
