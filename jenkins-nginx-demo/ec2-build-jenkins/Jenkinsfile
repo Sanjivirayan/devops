@@ -22,13 +22,13 @@ pipeline {
 
         string(
             name: 'VPC_ID',
-            defaultValue: '',
+            defaultValue: 'vpc-00a4ca1687969d281',
             description: 'VPC ID, for example vpc-0123456789abcdef0'
         )
 
         string(
             name: 'SUBNET_ID',
-            defaultValue: '',
+            defaultValue: 'subnet-08f1b8740ac4a2037',
             description: 'Public subnet ID, for example subnet-0123456789abcdef0'
         )
 
