@@ -43,7 +43,7 @@ pipeline {
 
         booleanParam(
             name: 'AUTO_DESTROY',
-            defaultValue: false,
+            defaultValue: true,
             description: 'Terminate EC2 and delete the security group after testing'
         )
     }
