@@ -1,0 +1,69 @@
+pipeline {
+    agent any
+
+    stages {
+
+        stage('Build') {
+            steps {
+                sh '''
+                mkdir -p build
+
+                cat > build/index.html <<EOF
+                <html>
+                <head>
+                    <title>Jenkins Demo</title>
+                </head>
+                <body>
+                    <h1>Deployment Successful</h1>
+                    <p>Application deployed using Jenkins Pipeline</p>
+                </body>
+                </html>
+                EOF
+                '''
+
+                echo 'Build completed'
+            }
+        }
+
+        stage('Validate') {
+            steps {
+                sh '''
+                test -f build/index.html
+                grep "Deployment Successful" build/index.html
+                '''
+                echo 'Validation successful'
+            }
+        }
+
+        stage('Deploy') {
+            steps {
+                sh '''
+                sudo cp build/index.html /usr/share/nginx/html/index.html
+                '''
+                echo 'Deployment completed'
+            }
+        }
+
+        stage('Smoke Test') {
+            steps {
+                sh '''
+                sleep 5
+
+                curl -s http://localhost | grep "Deployment Successful"
+                '''
+                echo 'Application verified'
+            }
+        }
+
+    }
+
+    post {
+        success {
+            echo 'Pipeline Successfully Completed'
+        }
+
+        failure {
+            echo 'Pipeline Failed'
+        }
+    }
+}
